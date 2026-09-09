@@ -1,0 +1,130 @@
+;; find -- POSIX find (IEEE Std 1003.1), the walk with no expression and
+;; with `-type f`.
+;;
+;;   find DIR           every path under DIR, DIR included
+;;   find DIR -type f   the regular files only
+;;
+;; ## The ORDER is not matched, and cannot be
+;;
+;; /usr/bin/find emits entries in the order the directory hands them over --
+;; readdir order, which is neither sorted nor stable across filesystems.
+;; Measured 2026-09-10 on a directory holding `a`, `c` and `f1.txt`, it
+;; emitted `f1.txt` BEFORE `a`.
+;;
+;; Wire 34 answers its listing sorted by bytes. There is no request form that
+;; asks for readdir order, so this walk cannot reproduce that sequence, and
+;; the test compares the two outputs SORTED -- the set and not the sequence.
+;; That is stated here rather than papered over, the same way org-ieee-ls
+;; compares against `LC_ALL=C` and org-ieee-grep against `-F`.
+;;
+;; What this DOES guarantee is its own order: depth-first, each directory
+;; before its contents, files before subdirectories, and every listing in
+;; byte order. That is deterministic, which readdir order is not.
+;;
+;; ## The stack is a string
+;;
+;; Mutual recursion is not available -- a callee must be declared before its
+;; caller -- so "visit this directory, then recurse into each subdirectory"
+;; cannot be written as two functions calling each other. The directories
+;; still to visit are carried as one "\n"-joined stack instead, pushed at the
+;; FRONT so the walk is depth-first, and every function here is
+;; self-recursive.
+(ns find.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn listing [dir :string] :string
+  (typed-cap-call :fs/browse :string :string dir))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+(defn tab [] :string
+  (string-substring "a	b" 1 2))
+
+(defn first-line [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) s (string-substring s 0 i))))
+
+(defn rest-lines [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) "" (string-substring s (+ i 1) (string-byte-length s)))))
+
+;; One "NAME<TAB>D" line, split.
+(defn entry-name [line :string] :string
+  (let [i (string-index-of line (tab))]
+    (if (< i 0) line (string-substring line 0 i))))
+
+(defn entry-dir? [line :string] :bool
+  (let [i (string-index-of line (tab))]
+    (if (< i 0)
+      false
+      (string=? (string-substring line (+ i 1) (+ i 2)) "1"))))
+
+(defn join-path [dir :string name :string] :string
+  (string-concat (string-concat dir "/") name))
+
+;; `find DIR -type f` is THREE arguments, not two: DIR, `-type`, `f`. Written
+;; as two, this answered false for every invocation and the flag did nothing
+;; -- and the no-flag case passed, so only `-type f` showed it.
+(defn files-only? [] :bool
+  (if (string=? (arg "") "3")
+    (if (string=? (arg "1") "-type") (string=? (arg "2") "f") false)
+    false))
+
+;; Emit the FILE entries of one listing, in the order the host gave them.
+(defn emit-files [dir :string rest :string] :i64
+  (if (= (string-byte-length rest) 0)
+    0
+    (let [line (first-line rest)]
+      (do
+        (if (entry-dir? line)
+          0
+          (do (emit (join-path dir (entry-name line))) (emit (nl)) 0))
+        (emit-files dir (rest-lines rest))))))
+
+;; The subdirectories of one listing, "\n"-joined and prefixed, in order.
+(defn subdir-paths [dir :string rest :string acc :string] :string
+  (if (= (string-byte-length rest) 0)
+    acc
+    (let [line (first-line rest)]
+      (subdir-paths dir (rest-lines rest)
+                    (if (entry-dir? line)
+                      (if (= (string-byte-length acc) 0)
+                        (join-path dir (entry-name line))
+                        (string-concat (string-concat acc (nl))
+                                       (join-path dir (entry-name line))))
+                      acc)))))
+
+;; Pop one directory, emit it and its files, then push its subdirectories at
+;; the FRONT -- which is what makes the walk depth-first rather than breadth.
+(defn walk [stack :string files? :bool] :i64
+  (if (= (string-byte-length stack) 0)
+    0
+    (let [dir (first-line stack)
+          rest (rest-lines stack)
+          entries (listing dir)
+          subs (subdir-paths dir entries "")]
+      (do
+        (if files? 0 (do (emit dir) (emit (nl)) 0))
+        (emit-files dir entries)
+        (walk (if (= (string-byte-length subs) 0)
+                rest
+                (if (= (string-byte-length rest) 0)
+                  subs
+                  (string-concat (string-concat subs (nl)) rest)))
+              files?)))))
+
+(defn main [] :i64
+  (let [root (arg "0")]
+    (if (string=? (listing root) "SENTINEL-NEVER")
+      1
+      (do (walk root (files-only?)) 0))))
