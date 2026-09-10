@@ -75,23 +75,80 @@ b" 1 2))
 ;; `find DIR -type f` is THREE arguments, not two: DIR, `-type`, `f`. Written
 ;; as two, this answered false for every invocation and the flag did nothing
 ;; -- and the no-flag case passed, so only `-type f` showed it.
-(defn files-only? [] :bool
-  (if (string=? (arg "") "3")
-    (if (string=? (arg "1") "-type") (string=? (arg "2") "f") false)
-    false))
+(defn exists? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
 
-;; Emit the FILE entries of one listing, in the order the host gave them.
-(defn emit-files [dir :string rest :string] :i64
+(defn digit-value [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (let [d (digit-value s i)]
+      (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
+
+(defn parse-count [s :string] :i64
+  (let [n (string-byte-length s)]
+    (if (= n 0) -1 (text->i64 s 0 n 0))))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; --- which kinds to report -----------------------------------------------
+;; 0 = every path, 1 = files only (-type f), 2 = directories only (-type d).
+;;
+;; This was a BOOLEAN until 2026-09-10, which made `-type d` unrepresentable:
+;; anything that was not `-type f` fell through to "report everything", so
+;; `find DIR -type d` listed the files too. A two-valued answer to a
+;; three-valued question is not a missing feature, it is a wrong one.
+;;
+;; And it asked whether the argument COUNT was 3, which is right for exactly
+;; one root and wrong for any other number -- `find a c` is also two
+;; arguments. Argument shape decides now, the same correction cut, uniq and
+;; ls each needed.
+(defn type-arg [] :string
+  (let [n (parse-count (arg ""))]
+    ;; Fewer than two arguments cannot carry `-type X`, and asking anyway
+    ;; computes the index -1: `decimal-of` has no answer for a negative and
+    ;; traps. Every case with exactly one argument died that way -- which is
+    ;; how the guard was found, since the cases WITH a flag all passed.
+    (if (< n 2)
+      ""
+      (if (string=? (arg (decimal-of (- n 2))) "-type")
+        (arg (decimal-of (- n 1)))
+        ""))))
+
+(defn mode [] :i64
+  (let [t (type-arg)]
+    (if (string=? t "f") 1 (if (string=? t "d") 2 0))))
+
+;; The operands: every argument, minus the trailing `-type X` when present.
+(defn root-count [] :i64
+  (let [n (parse-count (arg ""))]
+    (if (string=? (type-arg) "") n (- n 2))))
+
+;; --- one directory's entries ---------------------------------------------
+(defn emit-files [dir :string rest :string m :i64] :i64
   (if (= (string-byte-length rest) 0)
     0
     (let [line (first-line rest)]
       (do
         (if (entry-dir? line)
           0
-          (do (emit (join-path dir (entry-name line))) (emit (nl)) 0))
-        (emit-files dir (rest-lines rest))))))
+          (if (= m 2)
+            0
+            (do (emit (join-path dir (entry-name line))) (emit (nl)) 0)))
+        (emit-files dir (rest-lines rest) m)))))
 
-;; The subdirectories of one listing, "\n"-joined and prefixed, in order.
 (defn subdir-paths [dir :string rest :string acc :string] :string
   (if (= (string-byte-length rest) 0)
     acc
@@ -106,7 +163,7 @@ b" 1 2))
 
 ;; Pop one directory, emit it and its files, then push its subdirectories at
 ;; the FRONT -- which is what makes the walk depth-first rather than breadth.
-(defn walk [stack :string files? :bool] :i64
+(defn walk [stack :string m :i64] :i64
   (if (= (string-byte-length stack) 0)
     0
     (let [dir (first-line stack)
@@ -114,17 +171,72 @@ b" 1 2))
           entries (listing dir)
           subs (subdir-paths dir entries "")]
       (do
-        (if files? 0 (do (emit dir) (emit (nl)) 0))
-        (emit-files dir entries)
+        (if (= m 1) 0 (do (emit dir) (emit (nl)) 0))
+        (emit-files dir entries m)
         (walk (if (= (string-byte-length subs) 0)
                 rest
                 (if (= (string-byte-length rest) 0)
                   subs
                   (string-concat (string-concat subs (nl)) rest)))
-              files?)))))
+              m)))))
+
+;; --- is this operand a directory -----------------------------------------
+;; From STAT, whose fourth field is is-directory, and NOT from the parent's
+;; listing the way org-ieee-cp and org-ieee-ls read it.
+;;
+;; The parent trick cannot work here: find's root is frequently the granted
+;; scope root itself, and its parent lies OUTSIDE the grant, so browsing it
+;; traps. That is exactly what happened -- the three cases whose root was the
+;; scope root died with SIGILL while every case with a root beneath it
+;; passed. cp and ls never meet this because their operands are always inside
+;; the scope; find's is the scope.
+(defn field-4 [s :string i :i64 seen :i64] :string
+  (let [n (string-byte-length s)]
+    (if (>= i n)
+      ""
+      (let [sp (string-index-of (string-substring s i n) " ")]
+        (if (< sp 0)
+          (if (= seen 3) (string-substring s i n) "")
+          (if (= seen 3)
+            (string-substring s i (+ i sp))
+            (field-4 s (+ i (+ sp 1)) (+ seen 1))))))))
+
+(defn dir? [p :string] :bool
+  (string=? (field-4 (typed-cap-call :fs/app-data :string :string
+                                     (string-concat p "STAT_SEP"))
+                     0 0)
+            "1"))
+
+;; --- the operands --------------------------------------------------------
+;; A root that is NOT a directory is reported and not descended into --
+;; measured, `find f1.txt` answers `f1.txt`. A root that is not there is a
+;; diagnostic and exit 1; before this it reached `listing` and TRAPPED,
+;; because the only guard was a comparison against a sentinel that could
+;; never match.
+(defn one-root [path :string m :i64] :i64
+  (if (exists? path)
+    (if (dir? path)
+      (do (walk path m) 0)
+      (if (= m 2)
+        0
+        (do (emit path) (emit (nl)) 0)))
+    (do (emit-error "find: ")
+        (emit-error path)
+        (emit-error ": No such file or directory")
+        (emit-error (nl))
+        1)))
+
+(defn each [i :i64 stop :i64 m :i64 worst :i64] :i64
+  (if (>= i stop)
+    worst
+    (let [r (one-root (arg (decimal-of i)) m)]
+      (each (+ i 1) stop m (if (= r 1) 1 worst)))))
 
 (defn main [] :i64
-  (let [root (arg "0")]
-    (if (string=? (listing root) "SENTINEL-NEVER")
+  (let [n (root-count)]
+    (if (< n 1)
+      ;; No operand. POSIX find defaults to the working directory; there is
+      ;; no cwd capability, so this refuses rather than walking something
+      ;; else.
       1
-      (do (walk root (files-only?)) 0))))
+      (each 0 n (mode) 0))))

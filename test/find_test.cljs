@@ -41,7 +41,20 @@
    ;; directories gets wrong.
    "empty-dir/.keep" nil})
 
-(def cases [[] ["-type" "f"]])
+(def cases
+  [[] ["-type" "f"] ["-type" "d"]
+   ;; A root that is a FILE: reported, not descended into. Under -type d it
+   ;; contributes nothing.
+   [:file] [:file "-type" "f"] [:file "-type" "d"]
+   ;; An EMPTY directory as the root: it is itself a path find reports.
+   [:empty] [:empty "-type" "f"] [:empty "-type" "d"]
+   ;; A root that is NOT THERE: a diagnostic and exit 1. Before this the
+   ;; command reached `listing` and trapped with SIGILL, because its only
+   ;; guard compared against a sentinel that could never match.
+   [:missing] [:missing "-type" "f"]
+   ;; SEVERAL roots, walked in turn -- and one good with one missing, where
+   ;; the good one is still walked and the status is still 1.
+   [:two] [:two "-type" "f"] [:good-and-missing]])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -61,7 +74,7 @@
         (.mkdirSync fs (.dirname path full) #js {:recursive true})
         (when content (.writeFileSync fs full content "utf8"))))
     (.writeFileSync fs policy
-                    "{:allow #{[:cap/call 34] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}"
+                    "{:allow #{[:cap/call 34] [:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}"
                     "utf8")
     (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
                          "--policy" policy "--output" kexe])]
@@ -71,21 +84,51 @@
           offset (second (re-find #":offset (\d+)" (str (:out e))))]
       (when-not offset (refuse "no :offset in the extract report"))
       (let [p (run "nbb" [packager "--code" blob "--offset" offset "--isa" "aarch64"
-                          "--allow" "34,37,38,39"
+                          "--allow" "34,35,37,38,39"
+                          ;; EXISTS (wire 35) answers under the FS scope, not the
+                          ;; browse scope, so both are granted: browse to walk a
+                          ;; directory, exists to tell a missing root from a
+                          ;; present one without trapping.
+                          "--fs-scope" (.realpathSync fs data)
                           "--browse-scope" (.realpathSync fs data)
                           "--fuel" "50000000" "--pairs" "200000"
                           "--string-pool" "8000000" "--output" exe])]
         (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))))
     (let [root (.realpathSync fs data)
           lines (fn [b] (sort (remove str/blank? (str/split (.toString b "utf8") #"\n"))))
+          ;; A leading keyword names WHICH roots the case runs over; anything
+          ;; else is a flag passed through verbatim. Mapping a flag to a path
+          ;; would hand `-type` to the filesystem, both implementations would
+          ;; fail on the same nonexistent path, and every flag case would be
+          ;; green without a flag executing -- the shape that made 72 cases
+          ;; vacuous in org-ieee-sort.
+          roots-for (fn [flags]
+                      (case (first flags)
+                        :file    [(.join path root "f1.txt")]
+                        :empty   [(.join path root "empty-dir")]
+                        :missing [(.join path root "nope")]
+                        :two     [(.join path root "a") (.join path root "c")]
+                        :good-and-missing [(.join path root "a")
+                                           (.join path root "nope")]
+                        [root]))
+          flags-for (fn [flags] (vec (remove keyword? flags)))
           results
           (for [flags cases]
-            (let [k (run exe (into [root] flags))
-                  s (run system-find (into [root] flags))
+            (let [argv (into (roots-for flags) (flags-for flags))
+                  k (run exe argv)
+                  s (run system-find argv)
                   ours (lines (:out k))
-                  theirs (lines (:out s))]
-              {:flags flags :ok (and (= ours theirs) (= (:status k) (:status s)))
+                  theirs (lines (:out s))
+                  ;; stderr is compared too, and it is the ONLY thing that
+                  ;; separates a missing root from an empty result: both put
+                  ;; nothing on stdout.
+                  eq-err (= (.toString (:err k) "base64")
+                            (.toString (:err s) "base64"))]
+              {:flags flags :ok (and (= ours theirs) eq-err
+                                     (= (:status k) (:status s)))
                :count (count ours)
+               :exit [(:status k) (:status s)]
+               :err [(.toString (:err k) "utf8") (.toString (:err s) "utf8")]
                :only-ours (take 3 (remove (set theirs) ours))
                :only-theirs (take 3 (remove (set ours) theirs))}))
           bad (remove :ok results)]
@@ -93,7 +136,9 @@
         (println (str (if (:ok r) "  ok   " "  FAIL ")
                       (pr-str (:flags r)) " -> " (:count r) " paths"
                       (when-not (:ok r)
-                        (str "  only-ours=" (pr-str (:only-ours r))
-                             " only-theirs=" (pr-str (:only-theirs r)))))))
+                        (str " exit=" (pr-str (:exit r))
+                             " only-ours=" (pr-str (:only-ours r))
+                             " only-theirs=" (pr-str (:only-theirs r))
+                             " err=" (pr-str (:err r)))))))
       (println (pr-str {:ok (empty? bad) :cases (count results) :failed (count bad)}))
       (.exit js/process (if (seq bad) 1 0)))))

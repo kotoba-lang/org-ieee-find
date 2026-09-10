@@ -60,8 +60,55 @@ per entry, and neither arena reclaims — so package with `--pairs` and
 fifteen paths, which is far more than it needs and far less than `orgs/`
 would.
 
+## Several roots, `-type d`, and the roots that are not directories
+
+```
+find DIR              every path under DIR, DIR included
+find DIR -type f      the regular files
+find DIR -type d      the directories
+find FILE             FILE itself, not descended into
+find A C              several roots, walked in turn
+find nope             find: nope: No such file or directory      exit 1
+```
+
+The suite went from **2 cases to 14**, and the three it gained were not
+polish — each covered a defect:
+
+- **`-type` was a BOOLEAN**, so anything that was not `-type f` fell through
+  to "report everything" and `find DIR -type d` listed the files too. A
+  two-valued answer to a three-valued question is a wrong answer, not a
+  missing feature. Restoring the boolean fails the 2 `-type d` cases.
+- **A missing root TRAPPED.** The only guard compared `listing` against a
+  sentinel string that could never match, so a root that was not there
+  reached the browse wire and died with SIGILL. Removing the check now fails
+  the 3 cases involving one.
+- **A root that is a file reported nothing.** Making it silent again fails
+  the 2 file-root cases.
+
+## `dir?` reads STAT, not the parent's listing
+
+[`org-ieee-cp`](https://github.com/kotoba-lang/org-ieee-cp) and
+[`org-ieee-ls`](https://github.com/kotoba-lang/org-ieee-ls) answer "is this a
+directory" by browsing the path's **parent**. That cannot work here: find's
+root is frequently the granted scope root itself, whose parent lies **outside
+the grant**, so browsing it traps.
+
+That is exactly how it was found — the three cases whose root was the scope
+root died with SIGILL while every case with a root beneath it passed. `STAT`'s
+fourth field answers is-directory for the path itself, with no parent
+involved.
+
+## Order is still not compared
+
+`/usr/bin/find` emits in readdir order and wire 34 answers sorted, so stdout
+is compared as a **sorted set**. stderr and exit status are compared byte for
+byte — and for a missing root, stderr is the *only* thing that separates it
+from an empty result, since both put nothing on stdout.
+
 ## What this is not
 
 No expression language: no `-name`, `-path`, `-newer`, `-maxdepth`, `-exec`,
-`-print0`. `-type` accepts only `f`. One operand, and it must be an absolute
-path inside the packaged browse scope.
+`-print0`. `-type` accepts `f` and `d` only — `-type l` would need symlink
+detection, and wire 35 opens `O_NOFOLLOW`. The flag must come last, and with
+no operand at all this exits 1 rather than walking a working directory it
+cannot ask for.
