@@ -12,7 +12,7 @@
 ;; coincidence of how the files were created, not a property, and it is not
 ;; asserted.
 ;;
-;;   AMU_HOME=<amu checkout> nbb test/find_test.cljk
+;;   AMU_HOME=<amu checkout> kbb --backend sci test/find_test.cljk
 ;;
 ;; Exit 0 when every case matches, 1 on a difference, 2 when it could not run.
 (ns find-test
