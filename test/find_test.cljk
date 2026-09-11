@@ -1,4 +1,4 @@
-;; test/find_test.cljs — build the command and compare it with the system
+;; test/find_test.cljk — build the command and compare it with the system
 ;; find, as a SORTED SET rather than a sequence.
 ;;
 ;; The order cannot be matched and that is not this implementation's doing.
@@ -12,7 +12,7 @@
 ;; coincidence of how the files were created, not a property, and it is not
 ;; asserted.
 ;;
-;;   AMU_HOME=<amu checkout> nbb test/find_test.cljs
+;;   AMU_HOME=<amu checkout> nbb test/find_test.cljk
 ;;
 ;; Exit 0 when every case matches, 1 on a difference, 2 when it could not run.
 (ns find-test
