@@ -1,18 +1,33 @@
 ;; test/find_test.cljk — build the command and compare it with the system
-;; find, as a SORTED SET rather than a sequence.
+;; find twice: as a SORTED SET against `/usr/bin/find`, and as a SEQUENCE
+;; against `LC_ALL=C /usr/bin/find -s`.
 ;;
-;; The order cannot be matched and that is not this implementation's doing.
-;; /usr/bin/find emits entries in readdir order, which is neither sorted nor
+;; Plain find emits entries in readdir order, which is neither sorted nor
 ;; stable across filesystems; wire 34 answers its listing sorted by bytes and
 ;; has no request form that asks for readdir order. Measured 2026-09-10 on a
 ;; directory holding `a`, `c` and `f1.txt`, find emitted `f1.txt` BEFORE `a`.
+;; So against plain find only the set can be compared.
 ;;
-;; So both outputs are sorted before comparison, and the README says the same.
-;; On the fixture below the two sequences happen to agree exactly -- that is a
-;; coincidence of how the files were created, not a property, and it is not
-;; asserted.
+;; BSD find's `-s` walks each directory in lexicographical order, which under
+;; LC_ALL=C is byte order -- exactly the order wire 34 answers in, and the
+;; single-pass walk emits each entry as it reaches it, a directory before its
+;; contents. Measured 2026-09-15 on the fixture below and on a 34,803-entry
+;; tree: the two sequences are byte-identical. So the sequence IS compared,
+;; and a walk that reordered (files before subdirectories, breadth first)
+;; would fail here where the set comparison alone let it pass.
+;;
+;; The last case is a WIDE directory, 4,000 files beside 40 nested ones, under
+;; the same 200,000-pair budget as everything else. It is the case the
+;; previous walk cannot pass: three passes over each listing through
+;; `string-index-of` cost about one pair handle per byte, and that listing is
+;; 44,000 bytes. Measured: the previous core.kotoba traps SIGILL on it.
 ;;
 ;;   AMU_HOME=<amu checkout> kbb --backend sci test/find_test.cljk
+;;
+;; AMU_HOME must package with `--cpu-seconds` (amu 2026-09-15 or later); an
+;; older packager ignores unknown flags, so its report is checked for the
+;; echo and the suite refuses rather than running under a bound it did not
+;; ask for.
 ;;
 ;; Exit 0 when every case matches, 1 on a difference, 2 when it could not run.
 (ns find-test
@@ -54,11 +69,17 @@
    [:missing] [:missing "-type" "f"]
    ;; SEVERAL roots, walked in turn -- and one good with one missing, where
    ;; the good one is still walked and the status is still 1.
-   [:two] [:two "-type" "f"] [:good-and-missing]])
+   [:two] [:two "-type" "f"] [:good-and-missing]
+   ;; The WIDE directory (see the header): 4,040 entries under one root.
+   [:wide] [:wide "-type" "f"] [:wide "-type" "d"]])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
-      packager (.join path amu-home "scripts" "package-command.cljs")]
+      ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
+      ;; until 2026-09-15 no longer exists (the cljk rename), so the suite
+      ;; could not have run since.
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
   (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
   (when-not (.existsSync fs system-find) (refuse (str "no " system-find)))
   (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-find-"))
@@ -73,6 +94,17 @@
       (let [full (.join path data rel)]
         (.mkdirSync fs (.dirname path full) #js {:recursive true})
         (when content (.writeFileSync fs full content "utf8"))))
+    ;; The wide directory: 4,000 files whose names sort among 40 nested
+    ;; directories (a multi-byte name among them, since the cursor advances
+    ;; by code point), each nested one holding a file.
+    (let [wide (.join path data "wide")]
+      (.mkdirSync fs wide)
+      (dotimes [i 4000]
+        (.writeFileSync fs (.join path wide (str "f" (.padStart (str i) 4 "0") ".txt")) "" "utf8"))
+      (dotimes [i 40]
+        (let [d (.join path wide (str (if (= 7 i) "d日本語" (str "d" (.padStart (str i) 2 "0")))))]
+          (.mkdirSync fs d)
+          (.writeFileSync fs (.join path d "inner.txt") "" "utf8"))))
     (.writeFileSync fs policy
                     "{:allow #{[:cap/call 34] [:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}"
                     "utf8")
@@ -83,7 +115,7 @@
           _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
           offset (second (re-find #":offset (\d+)" (str (:out e))))]
       (when-not offset (refuse "no :offset in the extract report"))
-      (let [p (run "nbb" [packager "--code" blob "--offset" offset "--isa" "aarch64"
+      (let [p (run "node" [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
                           "--allow" "34,35,37,38,39"
                           ;; EXISTS (wire 35) answers under the FS scope, not the
                           ;; browse scope, so both are granted: browse to walk a
@@ -92,8 +124,16 @@
                           "--fs-scope" (.realpathSync fs data)
                           "--browse-scope" (.realpathSync fs data)
                           "--fuel" "50000000" "--pairs" "200000"
-                          "--string-pool" "8000000" "--output" exe])]
-        (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))))
+                          "--string-pool" "8000000"
+                          ;; The wide case reads 4,040 entries; on a loaded
+                          ;; machine that is more than the loader's default
+                          ;; second of CPU, and a SIGXCPU would look like a
+                          ;; failed comparison.
+                          "--cpu-seconds" "60" "--wall-seconds" "600"
+                          "--output" exe])]
+        (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))
+        (when-not (re-find #":cpu-seconds \"60\"" (str (:out p)))
+          (refuse "the packager did not echo --cpu-seconds: AMU_HOME predates 2026-09-15 and would bound the walk to one CPU second"))))
     (let [root (.realpathSync fs data)
           lines (fn [b] (sort (remove str/blank? (str/split (.toString b "utf8") #"\n"))))
           ;; A leading keyword names WHICH roots the case runs over; anything
@@ -110,6 +150,7 @@
                         :two     [(.join path root "a") (.join path root "c")]
                         :good-and-missing [(.join path root "a")
                                            (.join path root "nope")]
+                        :wide    [(.join path root "wide")]
                         [root]))
           flags-for (fn [flags] (vec (remove keyword? flags)))
           results
@@ -117,15 +158,23 @@
             (let [argv (into (roots-for flags) (flags-for flags))
                   k (run exe argv)
                   s (run system-find argv)
+                  ;; The sequence oracle. `env` carries LC_ALL=C so that
+                  ;; -s sorts by bytes, which is what wire 34 does.
+                  sorted-find (.spawnSync cp "/usr/bin/env"
+                                          (clj->js (into ["LC_ALL=C" system-find "-s"] argv))
+                                          #js {:encoding "buffer"})
                   ours (lines (:out k))
                   theirs (lines (:out s))
+                  seq-ok (= (.toString (:out k) "base64")
+                            (.toString (.-stdout sorted-find) "base64"))
                   ;; stderr is compared too, and it is the ONLY thing that
                   ;; separates a missing root from an empty result: both put
                   ;; nothing on stdout.
                   eq-err (= (.toString (:err k) "base64")
                             (.toString (:err s) "base64"))]
-              {:flags flags :ok (and (= ours theirs) eq-err
+              {:flags flags :ok (and (= ours theirs) eq-err seq-ok
                                      (= (:status k) (:status s)))
+               :seq-ok seq-ok
                :count (count ours)
                :exit [(:status k) (:status s)]
                :err [(.toString (:err k) "utf8") (.toString (:err s) "utf8")]
@@ -137,6 +186,7 @@
                       (pr-str (:flags r)) " -> " (:count r) " paths"
                       (when-not (:ok r)
                         (str " exit=" (pr-str (:exit r))
+                             " sequence=" (if (:seq-ok r) "same" "DIFFERS from find -s")
                              " only-ours=" (pr-str (:only-ours r))
                              " only-theirs=" (pr-str (:only-theirs r))
                              " err=" (pr-str (:err r)))))))
