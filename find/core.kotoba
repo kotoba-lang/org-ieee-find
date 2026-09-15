@@ -1,34 +1,47 @@
-;; find -- POSIX find (IEEE Std 1003.1), the walk with no expression and
-;; with `-type f`.
+;; find -- POSIX find (IEEE Std 1003.1): the walk with no expression, and
+;; with `-type f` / `-type d`.
 ;;
 ;;   find DIR           every path under DIR, DIR included
 ;;   find DIR -type f   the regular files only
+;;   find DIR -type d   the directories only
 ;;
-;; ## The ORDER is not matched, and cannot be
+;; ## The walk is one pass over each listing, and the order is `find -s`
 ;;
-;; /usr/bin/find emits entries in the order the directory hands them over --
-;; readdir order, which is neither sorted nor stable across filesystems.
-;; Measured 2026-09-10 on a directory holding `a`, `c` and `f1.txt`, it
-;; emitted `f1.txt` BEFORE `a`.
+;; Wire 34 answers a directory as "NAME<TAB>D" lines sorted by bytes, D being
+;; "1" for a directory. This walks that listing ONCE, left to right, with a
+;; byte cursor: at each line it takes the name as a zero-copy view, joins it
+;; to the directory's prefix, reports it, and -- when D is "1" -- descends
+;; into it right there before moving to the next line. So the order is:
+;; each directory before its contents, and within a directory the entries in
+;; byte order, files and directories interleaved. That is exactly what BSD
+;; `find -s` emits (measured 2026-09-15 against /usr/bin/find -s on a tree
+;; holding files beside directories), so the suite compares the SEQUENCE
+;; against `find -s`, not just the set.
 ;;
-;; Wire 34 answers its listing sorted by bytes. There is no request form that
-;; asks for readdir order, so this walk cannot reproduce that sequence, and
-;; the test compares the two outputs SORTED -- the set and not the sequence.
-;; That is stated here rather than papered over, the same way org-ieee-ls
-;; compares against `LC_ALL=C` and org-ieee-grep against `-F`.
+;; The previous shape walked each listing three times (files, then the
+;; subdirectory names, then the stack) through `string-index-of`, which on
+;; native allocates one pair handle per byte scanned, and carried the pending
+;; directories as one "\n"-joined string that was re-concatenated -- copied
+;; whole into the pool -- at every pop. Measured 2026-09-15: SIGILL after
+;; 7,272 files of a 34,803-entry tree, the arenas exhausted. This shape
+;; allocates two pairs per entry (the name view and the joined path) and
+;; copies each path once.
 ;;
-;; What this DOES guarantee is its own order: depth-first, each directory
-;; before its contents, files before subdirectories, and every listing in
-;; byte order. That is deterministic, which readdir order is not.
+;; ## `scan-to` walks by code point, not by byte
 ;;
-;; ## The stack is a string
+;; `string-code-point-at` refuses an offset that is not a code-point
+;; boundary, and directory names are UTF-8, so the cursor advances by the
+;; width the code point's VALUE implies (< 0x80 one byte, < 0x800 two,
+;; < 0x10000 three, else four). The bytes searched for -- TAB and the newline
+;; -- are ASCII and never occur inside a multi-byte sequence.
+;;
+;; ## Why descent and iteration are one function
 ;;
 ;; Mutual recursion is not available -- a callee must be declared before its
-;; caller -- so "visit this directory, then recurse into each subdirectory"
-;; cannot be written as two functions calling each other. The directories
-;; still to visit are carried as one "\n"-joined stack instead, pushed at the
-;; FRONT so the walk is depth-first, and every function here is
-;; self-recursive.
+;; caller -- so "walk this listing" and "descend into a directory" cannot be
+;; two functions calling each other. `walk-lines` does both: the descent is
+;; a non-tail self-call whose depth is the tree's depth, and moving to the
+;; next line is a tail self-call.
 (ns find.core (:export [main]))
 
 (defn arg [i :string] :string
@@ -40,41 +53,13 @@
 (defn emit-error [s :string] :string
   (typed-cap-call :io/write-error :string :string s))
 
-(defn listing [dir :string] :string
+(defn entries-of [dir :string] :string
   (typed-cap-call :fs/browse :string :string dir))
 
 (defn nl [] :string
   (string-substring "a
 b" 1 2))
 
-(defn tab [] :string
-  (string-substring "a	b" 1 2))
-
-(defn first-line [s :string] :string
-  (let [i (string-index-of s "\n")]
-    (if (< i 0) s (string-substring s 0 i))))
-
-(defn rest-lines [s :string] :string
-  (let [i (string-index-of s "\n")]
-    (if (< i 0) "" (string-substring s (+ i 1) (string-byte-length s)))))
-
-;; One "NAME<TAB>D" line, split.
-(defn entry-name [line :string] :string
-  (let [i (string-index-of line (tab))]
-    (if (< i 0) line (string-substring line 0 i))))
-
-(defn entry-dir? [line :string] :bool
-  (let [i (string-index-of line (tab))]
-    (if (< i 0)
-      false
-      (string=? (string-substring line (+ i 1) (+ i 2)) "1"))))
-
-(defn join-path [dir :string name :string] :string
-  (string-concat (string-concat dir "/") name))
-
-;; `find DIR -type f` is THREE arguments, not two: DIR, `-type`, `f`. Written
-;; as two, this answered false for every invocation and the flag did nothing
-;; -- and the no-flag case passed, so only `-type f` showed it.
 (defn exists? [path :string] :bool
   (string=? (typed-cap-call :fs/app-data :string :string
                             (string-concat path "EXISTS_SEP"))
@@ -105,22 +90,9 @@ b" 1 2))
 
 ;; --- which kinds to report -----------------------------------------------
 ;; 0 = every path, 1 = files only (-type f), 2 = directories only (-type d).
-;;
-;; This was a BOOLEAN until 2026-09-10, which made `-type d` unrepresentable:
-;; anything that was not `-type f` fell through to "report everything", so
-;; `find DIR -type d` listed the files too. A two-valued answer to a
-;; three-valued question is not a missing feature, it is a wrong one.
-;;
-;; And it asked whether the argument COUNT was 3, which is right for exactly
-;; one root and wrong for any other number -- `find a c` is also two
-;; arguments. Argument shape decides now, the same correction cut, uniq and
-;; ls each needed.
+;; Argument SHAPE decides, not the count: `find a c` is also two arguments.
 (defn type-arg [] :string
   (let [n (parse-count (arg ""))]
-    ;; Fewer than two arguments cannot carry `-type X`, and asking anyway
-    ;; computes the index -1: `decimal-of` has no answer for a negative and
-    ;; traps. Every case with exactly one argument died that way -- which is
-    ;; how the guard was found, since the cases WITH a flag all passed.
     (if (< n 2)
       ""
       (if (string=? (arg (decimal-of (- n 2))) "-type")
@@ -136,70 +108,63 @@ b" 1 2))
   (let [n (parse-count (arg ""))]
     (if (string=? (type-arg) "") n (- n 2))))
 
-;; --- one directory's entries ---------------------------------------------
-(defn emit-files [dir :string rest :string m :i64] :i64
-  (if (= (string-byte-length rest) 0)
-    0
-    (let [line (first-line rest)]
-      (do
-        (if (entry-dir? line)
-          0
-          (if (= m 2)
-            0
-            (do (emit (join-path dir (entry-name line))) (emit (nl)) 0)))
-        (emit-files dir (rest-lines rest) m)))))
+;; --- the scan ------------------------------------------------------------
+;; The byte offset of the first code point equal to B at or after I in S, or
+;; -1 when none lies before N. B is ASCII, so it is never a continuation
+;; byte and the cursor cannot pass over it inside a wider sequence.
+(defn scan-to [s :string i :i64 n :i64 b :i64] :i64
+  (if (>= i n)
+    -1
+    (let [c (string-code-point-at s i)]
+      (if (= c b)
+        i
+        (scan-to s
+                 (+ i (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+                 n b)))))
 
-(defn subdir-paths [dir :string rest :string acc :string] :string
-  (if (= (string-byte-length rest) 0)
-    acc
-    (let [line (first-line rest)]
-      (subdir-paths dir (rest-lines rest)
-                    (if (entry-dir? line)
-                      (if (= (string-byte-length acc) 0)
-                        (join-path dir (entry-name line))
-                        (string-concat (string-concat acc (nl))
-                                       (join-path dir (entry-name line))))
-                      acc)))))
+(defn report [path :string eol :string] :i64
+  (do (emit path) (emit eol) 0))
 
-;; Pop one directory, emit it and its files, then push its subdirectories at
-;; the FRONT -- which is what makes the walk depth-first rather than breadth.
-(defn walk [stack :string m :i64] :i64
-  (if (= (string-byte-length stack) 0)
+;; --- the walk ------------------------------------------------------------
+;; LISTING is one directory's wire-34 answer, I the offset of the line under
+;; the cursor, PREFIX that directory's path plus "/", M the mode, EOL the
+;; newline. A line is NAME, TAB, D; lines are joined by "\n" with no trailing
+;; one, so the line after the one whose TAB is at T starts at T + 3.
+;;
+;; Every pair handle counts: the arena never reclaims, and a walk of
+;; orgs/kotoba-lang (857,268 entries) trapped at 607,572 with five handles
+;; per entry. EOL is threaded through as a parameter rather than rebuilt by
+;; `(nl)` per line -- that view was one of the five -- and the byte length is
+;; re-read from the listing each iteration, which allocates nothing. What
+;; remains per entry is the name view, the joined path, and the two write
+;; counts wire 37 answers with; a directory adds its listing and its prefix.
+(defn walk-lines [listing :string i :i64 prefix :string m :i64 eol :string] :i64
+  (if (>= i (string-byte-length listing))
     0
-    (let [dir (first-line stack)
-          rest (rest-lines stack)
-          entries (listing dir)
-          subs (subdir-paths dir entries "")]
+    (let [t (scan-to listing i (string-byte-length listing) 9)
+          path (string-concat prefix (string-substring listing i t))]
       (do
-        (if (= m 1) 0 (do (emit dir) (emit (nl)) 0))
-        (emit-files dir entries m)
-        (walk (if (= (string-byte-length subs) 0)
-                rest
-                (if (= (string-byte-length rest) 0)
-                  subs
-                  (string-concat (string-concat subs (nl)) rest)))
-              m)))))
+        (if (= (string-code-point-at listing (+ t 1)) 49)
+          (do
+            (if (= m 1) 0 (report path eol))
+            (walk-lines (entries-of path) 0 (string-concat path "/") m eol))
+          (if (= m 2) 0 (report path eol)))
+        (walk-lines listing (+ t 3) prefix m eol)))))
 
 ;; --- is this operand a directory -----------------------------------------
-;; From STAT, whose fourth field is is-directory, and NOT from the parent's
-;; listing the way org-ieee-cp and org-ieee-ls read it.
-;;
-;; The parent trick cannot work here: find's root is frequently the granted
-;; scope root itself, and its parent lies OUTSIDE the grant, so browsing it
-;; traps. That is exactly what happened -- the three cases whose root was the
-;; scope root died with SIGILL while every case with a root beneath it
-;; passed. cp and ls never meet this because their operands are always inside
-;; the scope; find's is the scope.
+;; From STAT's fourth field. find's root is frequently the granted scope
+;; root itself, whose parent lies OUTSIDE the grant, so the parent-listing
+;; trick org-ieee-cp and org-ieee-ls use would trap here.
 (defn field-4 [s :string i :i64 seen :i64] :string
   (let [n (string-byte-length s)]
     (if (>= i n)
       ""
-      (let [sp (string-index-of (string-substring s i n) " ")]
+      (let [sp (scan-to s i n 32)]
         (if (< sp 0)
           (if (= seen 3) (string-substring s i n) "")
           (if (= seen 3)
-            (string-substring s i (+ i sp))
-            (field-4 s (+ i (+ sp 1)) (+ seen 1))))))))
+            (string-substring s i sp)
+            (field-4 s (+ sp 1) (+ seen 1))))))))
 
 (defn dir? [p :string] :bool
   (string=? (field-4 (typed-cap-call :fs/app-data :string :string
@@ -208,18 +173,15 @@ b" 1 2))
             "1"))
 
 ;; --- the operands --------------------------------------------------------
-;; A root that is NOT a directory is reported and not descended into --
-;; measured, `find f1.txt` answers `f1.txt`. A root that is not there is a
-;; diagnostic and exit 1; before this it reached `listing` and TRAPPED,
-;; because the only guard was a comparison against a sentinel that could
-;; never match.
+;; A root that is NOT a directory is reported and not descended into. A root
+;; that is not there is a diagnostic and exit 1.
 (defn one-root [path :string m :i64] :i64
   (if (exists? path)
     (if (dir? path)
-      (do (walk path m) 0)
-      (if (= m 2)
-        0
-        (do (emit path) (emit (nl)) 0)))
+      (do
+        (if (= m 1) 0 (report path (nl)))
+        (walk-lines (entries-of path) 0 (string-concat path "/") m (nl)))
+      (if (= m 2) 0 (report path (nl))))
     (do (emit-error "find: ")
         (emit-error path)
         (emit-error ": No such file or directory")

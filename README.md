@@ -1,114 +1,116 @@
 # kotoba-lang/org-ieee-find — POSIX `find`, as a Kotoba command binary
 
-The `find` walk from IEEE Std 1003.1, with no expression and with `-type f`,
-written in `.kotoba` and compiled to a standalone native executable.
+The `find` walk from IEEE Std 1003.1, with no expression and with `-type f`
+/ `-type d`, written in `.kotoba` and compiled to a standalone native
+executable.
 
 ```sh
-./find DIR           # every path under DIR, DIR included
-./find DIR -type f   # the regular files only
+./find DIR            # every path under DIR, DIR included
+./find DIR -type f    # the regular files
+./find DIR -type d    # the directories
+./find FILE           # FILE itself, not descended into
+./find A C            # several roots, walked in turn
+./find nope           # find: nope: No such file or directory      exit 1
 ```
 
-## The order is not matched, and cannot be
+## The order is `find -s`, and it is compared as a sequence
 
 `/usr/bin/find` emits entries in the order the directory hands them over —
-**readdir order**, which is neither sorted nor stable across filesystems.
-Measured 2026-09-10 on a directory holding `a`, `c` and `f1.txt`, it emitted
-`f1.txt` **before** `a`.
+**readdir order**, neither sorted nor stable across filesystems (measured
+2026-09-10: `f1.txt` before `a`). Wire 34 answers a directory's listing
+**sorted by bytes**, so plain find's order cannot be reproduced and against
+it only the *set* is compared.
 
-Wire 34 answers its listing **sorted by bytes**, and there is no request form
-that asks for readdir order. So this walk cannot reproduce that sequence, and
-the test compares both outputs **sorted** — the set, not the sequence. Same
-shape as [`org-ieee-ls`](https://github.com/kotoba-lang/org-ieee-ls) comparing
-against `LC_ALL=C` and
-[`org-ieee-grep`](https://github.com/kotoba-lang/org-ieee-grep) against `-F`:
-name the difference rather than paper over it.
+BSD find's `-s` walks each directory in lexicographical order, which under
+`LC_ALL=C` is byte order — the order wire 34 answers in. This walk emits
+every entry as it reaches it: **each directory before its contents, and
+within a directory the entries in byte order, files and directories
+interleaved.** Measured 2026-09-15 on the fixture, on a 34,803-entry tree
+and on an 857,322-entry tree: byte-identical to `LC_ALL=C /usr/bin/find
+-s`. The suite compares the sequence against it, so a walk that reordered
+would fail there even with the same set.
 
-On the test fixture the two sequences happen to agree exactly. That is a
-coincidence of how the files were created, not a property, and it is not
-asserted.
+## The walk is one pass, and every pair handle counts
 
-What this *does* guarantee is its own order: **depth-first, each directory
-before its contents, files before subdirectories, every listing in byte
-order.** That is deterministic, which readdir order is not.
+Until 2026-09-15 the walk read each listing three times through
+`string-index-of` — the files, then the subdirectory names, then a `"\n"`-
+joined stack of directories still to visit, re-concatenated at every pop.
+On native `string-index-of` costs about one pair handle per byte scanned and
+the stack copy costs its whole length in pool bytes per pop, and neither
+arena reclaims. Measured: SIGILL after 7,272 files of a 34,803-entry tree.
 
-## A control that passes, on purpose
+Now `walk-lines` moves a byte cursor over the listing once. At each line it
+takes the name as a zero-copy view, joins it to the directory's `prefix`
+(the path plus `/`), reports it, and — when the D flag is `1` — descends
+into it right there (a non-tail self-call, depth = the tree's depth) before
+the tail self-call that moves to the next line. Mutual recursion is not
+available, so iteration and descent are one function.
 
-Changing the traversal from depth-first to breadth-first **does not fail the
-suite** — the set is the same. That is not a gap in the test; it is the test
-being exactly as strong as its claim. A suite that failed there would be
-asserting an order the README says is not matched.
+Per entry that is **four handles**: the name view, the joined path, and the
+two write counts wire 37 answers with. A directory adds its listing and its
+prefix. The newline is threaded through as a parameter — building it with
+`(nl)` per line was a fifth handle, and with five the 857,322-entry walk
+trapped at 607,572.
 
-The two controls that *do* fail are the ones about content: reading `-type f`
-as two arguments instead of three leaves it doing nothing (and only that case
-shows it), and skipping the directory entry itself loses eight paths.
+`scan-to` advances by **code point**, not by byte: `string-code-point-at`
+refuses an offset inside a multi-byte sequence, and names are UTF-8. The
+bytes searched for (TAB, `\n`, space) are ASCII and never occur inside one.
 
-## The stack is a string
+## Measured against `/usr/bin/find`, `fd` (2026-09-15)
 
-Mutual recursion is not available — a callee must be declared before its
-caller — so "visit this directory, then recurse into each subdirectory"
-cannot be written as two functions calling each other. The directories still
-to visit are carried as one `"\n"`-joined stack, pushed at the **front** so
-the walk is depth-first, and every function here is self-recursive.
+Same machine, load average 95–145 so CPU seconds are the metric; the
+output is identical in every row. Packaged with amu's loader of the same
+date (buffered wire 37, `--cpu-seconds` / `--wall-seconds`, 64 Mi pair and
+1 GiB pool ceilings).
 
-## Capabilities and size
+| tree | entries | this find (user / sys) | `/usr/bin/find` | `fd -HI` (parallel) |
+|---|---|---|---|---|
+| amu | 8,719 | 0.02 / 0.09 s | 0.00 / 0.11 s | — |
+| app-news | 34,803 | 0.07 / 0.49 s | 0.05 / 1.4 s | — |
+| orgs/kotoba-lang | 857,322 | 1.64 / 18.5 s (wall 49 s) | 1.41 / 36.5 s (wall 76 s) | 1.90 / 22.7 s (wall 7.4 s) |
 
-`:cli/args` (38), `:fs/browse` (34), `:io/write` (37), `:io/write-error` (39).
+Less CPU than either, on every tree: the listing arrives with the
+directory flag from the dirent, so nothing is stat'ed. Wall time on the
+big tree is I/O serialisation, which is what `fd`'s parallel walk buys and
+this runtime does not have.
 
-A tree walk spends about eight pair handles per entry and concatenates a path
-per entry, and neither arena reclaims — so package with `--pairs` and
-`--string-pool` that match the tree. The suite uses 200,000 and 8 MB for
-fifteen paths, which is far more than it needs and far less than `orgs/`
-would.
-
-## Several roots, `-type d`, and the roots that are not directories
-
-```
-find DIR              every path under DIR, DIR included
-find DIR -type f      the regular files
-find DIR -type d      the directories
-find FILE             FILE itself, not descended into
-find A C              several roots, walked in turn
-find nope             find: nope: No such file or directory      exit 1
-```
-
-The suite went from **2 cases to 14**, and the three it gained were not
-polish — each covered a defect:
-
-- **`-type` was a BOOLEAN**, so anything that was not `-type f` fell through
-  to "report everything" and `find DIR -type d` listed the files too. A
-  two-valued answer to a three-valued question is a wrong answer, not a
-  missing feature. Restoring the boolean fails the 2 `-type d` cases.
-- **A missing root TRAPPED.** The only guard compared `listing` against a
-  sentinel string that could never match, so a root that was not there
-  reached the browse wire and died with SIGILL. Removing the check now fails
-  the 3 cases involving one.
-- **A root that is a file reported nothing.** Making it silent again fails
-  the 2 file-root cases.
+What bounds the tree this can walk is the arenas: about four handles and
+130 bytes per entry, nothing reclaimed. 857,322 entries is 3.9 Mi handles
+and 110 MiB — the reason the ceilings moved.
 
 ## `dir?` reads STAT, not the parent's listing
 
-[`org-ieee-cp`](https://github.com/kotoba-lang/org-ieee-cp) and
-[`org-ieee-ls`](https://github.com/kotoba-lang/org-ieee-ls) answer "is this a
-directory" by browsing the path's **parent**. That cannot work here: find's
-root is frequently the granted scope root itself, whose parent lies **outside
-the grant**, so browsing it traps.
+find's root is frequently the granted scope root itself, whose parent lies
+**outside** the grant, so the parent-listing trick `org-ieee-cp` and
+`org-ieee-ls` use traps here. `STAT`'s fourth field answers is-directory for
+the path itself.
 
-That is exactly how it was found — the three cases whose root was the scope
-root died with SIGILL while every case with a root beneath it passed. `STAT`'s
-fourth field answers is-directory for the path itself, with no parent
-involved.
+## The suite: 17 cases, sequence and set
 
-## Order is still not compared
+`test/find_test.cljk` compiles the guest, packages it (`AMU_HOME` must be
+amu of 2026-09-15 or later — the suite refuses a packager that does not
+echo `--cpu-seconds`, since that one would silently bound the walk to one
+CPU second), runs the binary, and compares stdout as a sorted set with
+`/usr/bin/find`, as a byte sequence with `LC_ALL=C /usr/bin/find -s`, and
+stderr and exit status byte for byte.
 
-`/usr/bin/find` emits in readdir order and wire 34 answers sorted, so stdout
-is compared as a **sorted set**. stderr and exit status are compared byte for
-byte — and for a missing root, stderr is the *only* thing that separates it
-from an empty result, since both put nothing on stdout.
+The last three cases are a **wide** directory — 4,000 files beside 40
+nested directories, one with a multi-byte name — under the same
+200,000-pair budget as everything else. Verified to fail as well as pass:
+the previous `core.kotoba` under this suite fails 9 of 17 — SIGILL on the
+wide cases and on the root walk that contains them, and `sequence=DIFFERS
+from find -s` on the two-root cases whose set it gets right.
 
 ## What this is not
 
-No expression language: no `-name`, `-path`, `-newer`, `-maxdepth`, `-exec`,
-`-print0`. `-type` accepts `f` and `d` only — `-type l` would need symlink
-detection, and wire 35 opens `O_NOFOLLOW`. The flag must come last, and with
-no operand at all this exits 1 rather than walking a working directory it
-cannot ask for.
+No expression language: no `-name`, `-path`, `-newer`, `-maxdepth`,
+`-exec`, `-print0`, `-prune`. `-type` accepts `f` and `d` only — `-type l`
+would need symlink detection, and wire 34 opens `O_NOFOLLOW`. The flag must
+come last, and with no operand at all this exits 1 rather than walking a
+working directory it cannot ask for. No parallel walk: the runtime has one
+thread.
+
+## Capabilities
+
+`:cli/args` (38), `:fs/browse` (34), `:fs/app-data` (35, for EXISTS and
+STAT), `:io/write` (37), `:io/write-error` (39).
