@@ -47,10 +47,11 @@ the tail self-call that moves to the next line. Mutual recursion is not
 available, so iteration and descent are one function.
 
 Per entry that is **four handles**: the name view, the joined path, and the
-two write counts wire 37 answers with. A directory adds its listing and its
-prefix. The newline is threaded through as a parameter — building it with
-`(nl)` per line was a fifth handle, and with five the 857,322-entry walk
-trapped at 607,572.
+two write counts wire 37 answers with — and since 2026-09-16 each entry
+is a region, so they are released before the next entry (see below). A
+directory adds its listing and its prefix. The newline is threaded through
+as a parameter — building it with `(nl)` per line was a fifth handle, and
+with five the unscoped 857,322-entry walk trapped at 607,572.
 
 `scan-to` advances by **code point**, not by byte: `string-code-point-at`
 refuses an offset inside a multi-byte sequence, and names are UTF-8. The
@@ -77,6 +78,22 @@ this runtime does not have.
 What bounds the tree this can walk is the arenas: about four handles and
 130 bytes per entry, nothing reclaimed. 857,322 entries is 3.9 Mi handles
 and 110 MiB — the reason the ceilings moved.
+
+## Each entry is a region (2026-09-16)
+
+`(arena-scope body)` — context ABI v6, ADR-2609160044 — releases every
+handle and byte its body allocated when it returns. Each entry of a listing
+is one: the joined path, the write counts and, for a directory, the whole
+subtree's listings and paths come back when the scope does. What stays
+live across a directory is its listing and its prefix, so the arena holds
+**depth × one listing, whatever the tree's size**.
+
+Measured on orgs/kotoba-lang, 857,825 entries, packaged with the loader's
+**default 4,096 handles** and a 4 MiB pool (the 12,727-entry listing on the
+way is 700 KB): completes, user 1.16 s / sys 12.6 s, wall 26 s — where the
+unscoped walk needed 3.9 Mi handles and 110 MiB of pool and was slower for
+having touched them. The suite packages 4,096 handles and 1 MiB, and the
+previous guest traps under that budget on its own wide case.
 
 ## `dir?` reads STAT, not the parent's listing
 

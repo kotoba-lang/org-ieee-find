@@ -138,17 +138,27 @@ b" 1 2))
 ;; re-read from the listing each iteration, which allocates nothing. What
 ;; remains per entry is the name view, the joined path, and the two write
 ;; counts wire 37 answers with; a directory adds its listing and its prefix.
+;; Each entry is a REGION (arena-scope, ABI v6): the joined path, the write
+;; counts and -- for a directory -- the whole subtree's listings and paths
+;; are released when the scope returns. What stays live across a directory
+;; is its listing and its prefix, so the arena holds depth x one listing,
+;; whatever the tree's size: measured 2026-09-16, orgs/kotoba-lang's 857,322
+;; entries walk under the loader's DEFAULT 4,096 handles (with a 4 MiB pool
+;; for the 12,727-entry listing on the way), where the unscoped walk needed
+;; 3.9 Mi handles and 110 MiB. The descent inside the scope is a non-tail
+;; self-call, which is what it always was.
 (defn walk-lines [listing :string i :i64 prefix :string m :i64 eol :string] :i64
   (if (>= i (string-byte-length listing))
     0
-    (let [t (scan-to listing i (string-byte-length listing) 9)
-          path (string-concat prefix (string-substring listing i t))]
+    (let [t (scan-to listing i (string-byte-length listing) 9)]
       (do
-        (if (= (string-code-point-at listing (+ t 1)) 49)
-          (do
-            (if (= m 1) 0 (report path eol))
-            (walk-lines (entries-of path) 0 (string-concat path "/") m eol))
-          (if (= m 2) 0 (report path eol)))
+        (arena-scope
+         (let [path (string-concat prefix (string-substring listing i t))]
+           (if (= (string-code-point-at listing (+ t 1)) 49)
+             (do
+               (if (= m 1) 0 (report path eol))
+               (walk-lines (entries-of path) 0 (string-concat path "/") m eol))
+             (if (= m 2) 0 (report path eol)))))
         (walk-lines listing (+ t 3) prefix m eol)))))
 
 ;; --- is this operand a directory -----------------------------------------

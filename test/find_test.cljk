@@ -123,8 +123,15 @@
                           ;; present one without trapping.
                           "--fs-scope" (.realpathSync fs data)
                           "--browse-scope" (.realpathSync fs data)
-                          "--fuel" "50000000" "--pairs" "200000"
-                          "--string-pool" "8000000"
+                          ;; The loader's DEFAULT handle budget and a 1 MiB
+                          ;; pool: with each entry a region (arena-scope,
+                          ;; ABI v6) the walk holds depth x one listing, so
+                          ;; the 4,081-path wide case runs where the unscoped
+                          ;; guest -- four handles per entry, never released
+                          ;; -- trapped at about the thousandth. The budget
+                          ;; is the measurement.
+                          "--fuel" "50000000" "--pairs" "4096"
+                          "--string-pool" "1048576"
                           ;; The wide case reads 4,040 entries; on a loaded
                           ;; machine that is more than the loader's default
                           ;; second of CPU, and a SIGXCPU would look like a
